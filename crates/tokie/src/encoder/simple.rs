@@ -7,6 +7,8 @@
 
 use foldhash::HashMap as FoldHashMap;
 use smallvec::SmallVec;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 
 use crate::types::TokenId;
 
@@ -73,7 +75,10 @@ impl BytePairEncoder {
         // Fallback for unmapped bytes
         for (i, token) in byte_lut.iter_mut().enumerate() {
             if *token == 0 && i < base_tokens.len() {
-                if base_tokens.get(i).is_some_and(|b| b.len() == 1 && b[0] == i as u8) {
+                if base_tokens
+                    .get(i)
+                    .is_some_and(|b| b.len() == 1 && b[0] == i as u8)
+                {
                     *token = i as TokenId;
                 }
             }
@@ -272,11 +277,15 @@ impl BytePairEncoder {
             }
         }
 
+        // Long pretokenizer pieces (notably GLM whitespace runs) make the
+        // scan-and-shift loop below quadratic. Keep its cheap small-piece path.
+        if text.len() >= 1024 {
+            return self.encode_long(text);
+        }
+
         // Initialize with byte tokens using SmallVec (stack allocation for ≤16 tokens)
-        let mut tokens: SmallVec<[TokenId; 16]> = text
-            .iter()
-            .map(|&b| self.byte_lut[b as usize])
-            .collect();
+        let mut tokens: SmallVec<[TokenId; 16]> =
+            text.iter().map(|&b| self.byte_lut[b as usize]).collect();
 
         let mut len = tokens.len();
 
@@ -288,7 +297,9 @@ impl BytePairEncoder {
             let mut best_merged = 0;
 
             for i in 0..len - 1 {
-                if let Some(&(merged, rank)) = self.pair_lookup.get(&pack_pair(tokens[i], tokens[i + 1])) {
+                if let Some(&(merged, rank)) =
+                    self.pair_lookup.get(&pack_pair(tokens[i], tokens[i + 1]))
+                {
                     if rank < best_rank {
                         best_rank = rank;
                         best_pos = i;
@@ -310,6 +321,71 @@ impl BytePairEncoder {
 
         tokens.truncate(len);
         tokens.into_vec()
+    }
+
+    /// The same lowest-rank, leftmost merge order as `encode`, with a heap of
+    /// adjacent pairs and stable byte positions instead of repeated full scans.
+    fn encode_long(&self, text: &[u8]) -> Vec<TokenId> {
+        let len = text.len();
+        let mut tokens: Vec<TokenId> = text.iter().map(|&b| self.byte_lut[b as usize]).collect();
+        let mut prev: Vec<usize> = (0..len).map(|i| i.wrapping_sub(1)).collect();
+        let mut next: Vec<usize> = (0..len).map(|i| i + 1).collect();
+        let mut alive = vec![true; len];
+        let mut heap = BinaryHeap::new();
+
+        for left in 0..len - 1 {
+            self.push_pair(&tokens, &next, left, &mut heap);
+        }
+
+        while let Some(Reverse((rank, left, merged))) = heap.pop() {
+            if !alive[left] || next[left] == len {
+                continue;
+            }
+            let right = next[left];
+            if self
+                .pair_lookup
+                .get(&pack_pair(tokens[left], tokens[right]))
+                != Some(&(merged, rank))
+            {
+                continue;
+            }
+
+            tokens[left] = merged;
+            alive[right] = false;
+            next[left] = next[right];
+            if next[left] < len {
+                prev[next[left]] = left;
+            }
+            if prev[left] < len {
+                self.push_pair(&tokens, &next, prev[left], &mut heap);
+            }
+            self.push_pair(&tokens, &next, left, &mut heap);
+        }
+
+        let mut result = Vec::new();
+        let mut position = 0;
+        while position < len {
+            result.push(tokens[position]);
+            position = next[position];
+        }
+        result
+    }
+
+    fn push_pair(
+        &self,
+        tokens: &[TokenId],
+        next: &[usize],
+        left: usize,
+        heap: &mut BinaryHeap<Reverse<(u32, usize, TokenId)>>,
+    ) {
+        if next[left] < tokens.len() {
+            if let Some(&(merged, rank)) = self
+                .pair_lookup
+                .get(&pack_pair(tokens[left], tokens[next[left]]))
+            {
+                heap.push(Reverse((rank, left, merged)));
+            }
+        }
     }
 }
 
