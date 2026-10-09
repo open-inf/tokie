@@ -369,6 +369,7 @@ pub struct Tokenizer {
     /// Process-unique id tagging pooled pretoken-cache contents (see
     /// `crate::pool`).
     cache_generation: u64,
+    no_parallel: bool,
 }
 
 impl Tokenizer {
@@ -397,6 +398,7 @@ impl Tokenizer {
             added_tokens_raw: Vec::new(),
             added_tokens_serialized: false,
             cache_generation: crate::pool::next_generation(),
+            no_parallel: false,
         }
     }
 
@@ -535,6 +537,8 @@ impl Tokenizer {
     pub fn decoder(&self) -> &Decoder { &self.decoder }
     pub fn pretokenizer(&self) -> Option<&Pretokenizer> { self.pretokenizer.as_ref() }
     pub fn set_pretokenizer(&mut self, pretok: Option<Pretokenizer>) { self.pretokenizer = pretok; }
+    /// Disable per-document worker spawning when serving concurrent requests.
+    pub fn set_no_parallel(&mut self, value: bool) { self.no_parallel = value; }
     pub fn vocab_size(&self) -> usize { self.decoder.vocab_size() }
     pub fn pad_token_id(&self) -> Option<TokenId> { self.pad_token_id }
     pub fn padding(&self) -> Option<&PaddingParams> { self.padding.as_ref() }
@@ -846,7 +850,7 @@ impl Tokenizer {
     /// disabled. Standalone calls check out a pooled lease and keep the
     /// parallel path for large documents.
     fn encode_raw_ctx(&self, text: &str, cache: Option<&mut WorkerCaches>) -> Vec<TokenId> {
-        let allow_parallel = cache.is_none();
+        let allow_parallel = cache.is_none() && !self.no_parallel;
         if cache.is_none() && self.encoder.as_backtracking().is_some() && self.pretokenizer.is_some() {
             let mut lease = crate::pool::CacheLease::checkout(self.cache_generation);
             return self.encode_raw_dispatch(text, Some(lease.caches()), allow_parallel);
